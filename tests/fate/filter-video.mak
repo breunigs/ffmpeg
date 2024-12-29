@@ -696,9 +696,11 @@ $(FATE_FILTER_VSYNTH-yes): SRC = $(TARGET_PATH)/tests/vsynth1/%02d.pgm
 
 FATE_FFMPEG += $(FATE_FILTER_VSYNTH-yes)
 
-FATE_FILTER_FREI0R-$(call ALLYES, TESTSRC2_FILTER FREI0R_FILTER) = fate-filter-frei0r-filter
+FATE_FILTER_FREI0R-$(call ALLYES, TESTSRC2_FILTER FREI0R_FILTER) = fate-filter-frei0r-filter fate-filter-frei0r-mixer2 fate-filter-frei0r-mixer3
 $(FATE_FILTER_FREI0R-yes): SRC = testsrc2=s=319x240:r=1:d=5
 fate-filter-frei0r-filter: CMD = framecrc -lavfi "$(SRC),frei0r=enable=gte(n\,3):filter_name=distort0r"
+fate-filter-frei0r-mixer2: CMD = framecrc -lavfi "$(SRC)[v1];$(SRC)[v2],[v1][v2]frei0r=filter_name=addition"
+fate-filter-frei0r-mixer3: CMD = framecrc -lavfi "$(SRC)[v1];$(SRC)[v2];$(SRC)[v3];[v1][v2][v3]frei0r=filter_name=RGB"
 FATE_FFMPEG += $(FATE_FILTER_FREI0R-yes)
 
 FATE_FILTER_FREI0R_SRC-$(CONFIG_FREI0R_SRC_FILTER) = fate-filter-frei0r-source

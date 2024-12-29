@@ -14650,7 +14650,18 @@ positions:
 @example
 frei0r=perspective:0.2/0.2|0.8/0.2
 @end example
+
+@item
+Apply the addition effect, which takes two inputs.
+@example
+ffmpeg -i INPUT1 -i INPUT2 -filter_complex "[0][1]frei0r=addition" OUTPUT
+@end example
 @end itemize
+
+If multiple inputs are given, they all must have the same width and height.
+Properties are taken from the first input.
+
+This filter also supports the @ref{framesync} options.
 
 For more information, see
 @url{http://frei0r.dyne.org}
