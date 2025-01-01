@@ -371,7 +371,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     av_frame_copy_props(out, in);
 
-    time = in->pts * av_q2d(inlink->time_base) * 1000;
+    time = in->pts * av_q2d(inlink->time_base);
 
     if (in->linesize[0] != out->linesize[0]) {
         AVFrame *in2 = ff_default_get_video_buffer2(outlink, outlink->w, outlink->h, 1);
