@@ -741,11 +741,16 @@ $(FATE_FILTER_VSYNTH-yes): SRC = $(TARGET_PATH)/tests/vsynth1/%02d.pgm
 
 FATE_FFMPEG += $(FATE_FILTER_VSYNTH-yes)
 
-FATE_FILTER_FREI0R-$(call FILTERFRAMECRC, TESTSRC2, FREI0R_FILTER) = fate-filter-frei0r-filter fate-filter-frei0r-filter-unaligned
+FATE_FILTER_FREI0R-$(call FILTERFRAMECRC, TESTSRC2, FREI0R_FILTER) = fate-filter-frei0r-filter fate-filter-frei0r-filter-unaligned fate-filter-frei0r-mixer2 fate-filter-frei0r-mixer3
 fate-filter-frei0r-filter: CMD = framecrc -lavfi "testsrc2=r=1:d=5,frei0r=enable=gte(n\,3):filter_name=distort0r"
 fate-filter-frei0r-filter-unaligned: CMD = framecrc -lavfi "testsrc2=s=328x240:r=1:d=5,frei0r=filter_name=distort0r"
+fate-filter-frei0r-mixer2: CMD = framecrc -lavfi "testsrc2=r=1:d=5[v1];testsrc2=r=1:d=5[v2];[v1][v2]frei0r=filter_name=addition"
+fate-filter-frei0r-mixer3: CMD = framecrc -lavfi "testsrc2=r=1:d=5[v1];testsrc2=r=1:d=5[v2];testsrc2=r=1:d=5[v3];[v1][v2][v3]frei0r=filter_name=RGB"
 FATE_FFMPEG += $(FATE_FILTER_FREI0R-yes)
 
+FATE_FILTER_FREI0R_SRC-$(call FILTERFRAMECRC, FREI0R_SRC) = fate-filter-frei0r-source
+fate-filter-frei0r-source: CMD = framecrc -lavfi "frei0r_src=200x200:5:onecol0r:1/2/3" -frames:v 5
+FATE_FFMPEG += $(FATE_FILTER_FREI0R_SRC-yes)
 #
 # Metadata tests
 #
