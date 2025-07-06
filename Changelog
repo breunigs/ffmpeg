@@ -23,6 +23,7 @@ version <next>:
 - pad_cuda filter
 - Sanyo LD-ADPCM decoder
 - APV in MP4/ISOBMFF demuxing
+- vf_frei0r: pass time to filters in seconds
 
 
 version 7.1:
