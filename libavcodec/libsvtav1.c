@@ -25,6 +25,7 @@
 #include <EbSvtAv1Enc.h>
 #include <EbSvtAv1Metadata.h>
 
+#include "libavutil/base64.h"
 #include "libavutil/common.h"
 #include "libavutil/frame.h"
 #include "libavutil/imgutils.h"
@@ -380,6 +381,14 @@ static int config_enc_params(EbSvtAv1EncConfiguration *param,
         cpb_props->avg_bitrate = avctx->bit_rate;
     }
 
+    if (avctx->flags & AV_CODEC_FLAG_PASS2) {
+        param->pass = 2;
+    } else if (avctx->flags & AV_CODEC_FLAG_PASS1) {
+        param->pass = 1;
+    } else {
+        param->pass = 0;
+    }
+
     return 0;
 }
 
@@ -442,6 +451,33 @@ static av_cold int eb_enc_init(AVCodecContext *avctx)
     if (ret < 0) {
         av_log(avctx, AV_LOG_ERROR, "Error configuring encoder parameters\n");
         return ret;
+    }
+
+    if (svt_enc->enc_params.pass == 2) {
+        int decode_size;
+
+        if (!avctx->stats_in) {
+            av_log(avctx, AV_LOG_ERROR, "No stats file for second pass\n");
+            return AVERROR_INVALIDDATA;
+        }
+
+        svt_enc->enc_params.rc_stats_buffer.sz = strlen(avctx->stats_in) * 3 / 4;
+        svt_enc->enc_params.rc_stats_buffer.buf = av_malloc(svt_enc->enc_params.rc_stats_buffer.sz);
+        if (!svt_enc->enc_params.rc_stats_buffer.buf) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Stat buffer alloc (%"SIZE_SPECIFIER" bytes) failed\n",
+                   svt_enc->enc_params.rc_stats_buffer.sz);
+            svt_enc->enc_params.rc_stats_buffer.sz = 0;
+            return AVERROR(ENOMEM);
+        }
+        decode_size = av_base64_decode(svt_enc->enc_params.rc_stats_buffer.buf, avctx->stats_in,
+                                       svt_enc->enc_params.rc_stats_buffer.sz);
+        if (decode_size < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Stat buffer decode failed\n");
+            return AVERROR_INVALIDDATA;
+        }
+
+        svt_enc->enc_params.rc_stats_buffer.sz = decode_size;
     }
 
     svt_ret = svt_av1_enc_set_parameter(svt_enc->svt_handle, &svt_enc->enc_params);
@@ -615,9 +651,31 @@ static int eb_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
 
 #if SVT_AV1_CHECK_VERSION(2, 0, 0)
     if (headerPtr->flags & EB_BUFFERFLAG_EOS) {
-         svt_enc->eos_flag = EOS_RECEIVED;
-         svt_av1_enc_release_out_buffer(&headerPtr);
-         return AVERROR_EOF;
+        svt_enc->eos_flag = EOS_RECEIVED;
+
+        if (svt_enc->enc_params.pass == 1) {
+            SvtAv1FixedBuf first_pass_stat;
+            EbErrorType    ret = svt_av1_enc_get_stream_info(
+                svt_enc->svt_handle,
+                SVT_AV1_STREAM_INFO_FIRST_PASS_STATS_OUT,
+                &first_pass_stat);
+
+            if (ret == EB_ErrorNone) {
+                size_t b64_size = AV_BASE64_SIZE(first_pass_stat.sz);
+                avctx->stats_out = av_malloc(b64_size);
+                if (!avctx->stats_out) {
+                    av_log(avctx, AV_LOG_ERROR, "Stat buffer alloc (%"SIZE_SPECIFIER" bytes) failed\n",
+                           b64_size);
+                    return AVERROR(ENOMEM);
+                }
+
+                av_base64_encode(avctx->stats_out, b64_size, first_pass_stat.buf,
+                                 first_pass_stat.sz);
+            }
+        }
+
+        svt_av1_enc_release_out_buffer(&headerPtr);
+        return AVERROR_EOF;
     }
 #endif
 
@@ -679,6 +737,11 @@ static av_cold int eb_enc_close(AVCodecContext *avctx)
         av_free(svt_enc->in_buf->p_buffer);
         svt_metadata_array_free(&svt_enc->in_buf->metadata);
         av_freep(&svt_enc->in_buf);
+    }
+
+    if (svt_enc->enc_params.rc_stats_buffer.buf) {
+        av_freep(&svt_enc->enc_params.rc_stats_buffer.buf);
+        svt_enc->enc_params.rc_stats_buffer.sz = 0;
     }
 
     av_buffer_pool_uninit(&svt_enc->pool);
