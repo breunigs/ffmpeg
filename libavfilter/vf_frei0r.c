@@ -41,6 +41,7 @@
 #include "avfilter.h"
 #include "filters.h"
 #include "formats.h"
+#include "framesync.h"
 #include "video.h"
 
 #ifdef __APPLE__
@@ -75,6 +76,9 @@ typedef struct Frei0rContext {
     f0r_destruct_f        destruct;
     f0r_deinit_f          deinit;
 
+    FFFrameSync fs;
+    AVFrame **frames;
+    int nb_inputs;
     char *dl_name;
     char *params;
     AVRational framerate;
@@ -291,6 +295,8 @@ static av_cold int frei0r_init(AVFilterContext *ctx,
         return AVERROR(EINVAL);
     }
 
+    s->nb_inputs = type == F0R_PLUGIN_TYPE_SOURCE ? 0 : 1;
+
     av_log(ctx, AV_LOG_VERBOSE,
            "name:%s author:'%s' explanation:'%s' color_model:%s "
            "frei0r_version:%d version:%d.%d num_params:%d\n",
@@ -306,8 +312,24 @@ static av_cold int frei0r_init(AVFilterContext *ctx,
 static av_cold int filter_init(AVFilterContext *ctx)
 {
     Frei0rContext *s = ctx->priv;
+    AVFilterPad pad = {
+        .type = AVMEDIA_TYPE_VIDEO,
+        .name = av_strdup("input0"),
+    };
+    int ret;
 
-    return frei0r_init(ctx, s->dl_name, F0R_PLUGIN_TYPE_FILTER);
+    ret = frei0r_init(ctx, s->dl_name, F0R_PLUGIN_TYPE_FILTER);
+    if (ret < 0)
+        return ret;
+
+    s->frames = av_calloc(1, sizeof(*s->frames));
+    if (!s->frames)
+        return AVERROR(ENOMEM);
+
+    if (!pad.name)
+        return AVERROR(ENOMEM);
+
+    return ff_append_inpad_free_name(ctx, &pad);
 }
 
 static av_cold void uninit(AVFilterContext *ctx)
@@ -320,21 +342,9 @@ static av_cold void uninit(AVFilterContext *ctx)
         s->deinit();
     if (s->dl_handle)
         dlclose(s->dl_handle);
-}
 
-static int config_input_props(AVFilterLink *inlink)
-{
-    AVFilterContext *ctx = inlink->dst;
-    Frei0rContext *s = ctx->priv;
-
-    if (s->destruct && s->instance)
-        s->destruct(s->instance);
-    if (!(s->instance = s->construct(inlink->w, inlink->h))) {
-        av_log(ctx, AV_LOG_ERROR, "Impossible to load frei0r instance.\n");
-        return AVERROR(EINVAL);
-    }
-
-    return set_params(ctx, s->params);
+    ff_framesync_uninit(&s->fs);
+    av_freep(&s->frames);
 }
 
 static int query_formats(const AVFilterContext *ctx,
@@ -364,43 +374,127 @@ static int query_formats(const AVFilterContext *ctx,
     return ff_set_common_formats2(ctx, cfg_in, cfg_out, formats);
 }
 
-static int filter_frame(AVFilterLink *inlink, AVFrame *in)
+static int filter_activate(AVFilterContext *ctx)
 {
-    Frei0rContext *s = inlink->dst->priv;
-    AVFilterLink *outlink = inlink->dst->outputs[0];
+    Frei0rContext *s = ctx->priv;
+    return ff_framesync_activate(&s->fs);
+}
+
+static int filter_frame(FFFrameSync *fs)
+{
+    AVFilterContext *ctx = fs->parent;
+    AVFilterLink *outlink = ctx->outputs[0];
+    Frei0rContext *s = fs->opaque;
+    AVFrame **in = s->frames;
+    int copies = 0;
+    AVFrame *out;
+    int i, ret;
+    double time;
+
+    for (i=0; i < s->nb_inputs; i++) {
+        ret = ff_framesync_get_frame(&s->fs, i, &in[i], 0);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (ctx->is_disabled) {
+        out = av_frame_clone(in[0]);
+        if (!out)
+            return AVERROR(ENOMEM);
+        return ff_filter_frame(outlink, out);
+    }
+
     /* align parameter is the line alignment, not the buffer alignment.
      * frei0r expects line size to be width*4 so we want an align of 1
      * to ensure lines aren't padded out. */
-    AVFrame *out = ff_default_get_video_buffer2(outlink, outlink->w, outlink->h, 1);
+    out = ff_default_get_video_buffer2(outlink, outlink->w, outlink->h, 1);
     if (!out)
-        goto fail;
+        return AVERROR(ENOMEM);
 
-    av_frame_copy_props(out, in);
+    ret = av_frame_copy_props(out, in[0]);
+    if (ret < 0) {
+        av_frame_free(&out);
+        return ret;
+    }
+    out->pts = av_rescale_q(s->fs.pts, s->fs.time_base, outlink->time_base);
 
-    if (in->linesize[0] != out->linesize[0]) {
-        AVFrame *in2 = ff_default_get_video_buffer2(outlink, outlink->w, outlink->h, 1);
-        if (!in2)
-            goto fail;
-        av_frame_copy(in2, in);
-        if (av_frame_copy_props(in2, in) < 0) {
-            av_frame_free(&in2);
-            goto fail;
+    time = s->fs.pts * av_q2d(s->fs.time_base);
+
+    for (i=0; i < s->nb_inputs; i++) {
+        if (in[i]->linesize[0] != out->linesize[0]) {
+            AVFrame *aligned = ff_default_get_video_buffer2(outlink, outlink->w, outlink->h, 1);
+            if(!aligned)
+                goto end;
+            ret = av_frame_copy(aligned, in[i]);
+            copies |= 1 << i;
+            in[i] = aligned;
+            if(ret < 0)
+                goto end;
         }
-        av_frame_free(&in);
-        in = in2;
     }
 
-    s->update(s->instance, in->pts * av_q2d(inlink->time_base),
-                   (const uint32_t *)in->data[0],
-                   (uint32_t *)out->data[0]);
+    s->update(s->instance, time,
+                (const uint32_t *)in[0]->data[0],
+                (uint32_t *)out->data[0]);
 
-    av_frame_free(&in);
+    ret = ff_filter_frame(outlink, out);
 
-    return ff_filter_frame(outlink, out);
-fail:
-    av_frame_free(&in);
-    av_frame_free(&out);
-    return AVERROR(ENOMEM);
+end:
+    for (i=0; i < s->nb_inputs; i++) {
+        if ((copies >> i) & 0x1)
+            av_frame_free(&in[i]);
+    }
+
+    return ret;
+}
+
+static int filter_config_props(AVFilterLink *outlink)
+{
+    AVFilterContext *ctx = outlink->src;
+    Frei0rContext *s = ctx->priv;
+    FilterLink *il = ff_filter_link(ctx->inputs[0]);
+    FilterLink *ol = ff_filter_link(outlink);
+    int height = ctx->inputs[0]->h;
+    int width = ctx->inputs[0]->w;
+    int i, ret;
+
+    if (s->destruct && s->instance)
+        s->destruct(s->instance);
+    s->instance = s->construct(width, height);
+    if (!s->instance) {
+        av_log(ctx, AV_LOG_ERROR, "Impossible to load frei0r instance.\n");
+        return AVERROR(EINVAL);
+    }
+
+    ret = set_params(ctx, s->params);
+    if (ret < 0)
+        return ret;
+
+    outlink->w = width;
+    outlink->h = height;
+    outlink->sample_aspect_ratio = ctx->inputs[0]->sample_aspect_ratio;
+    ol->frame_rate = il->frame_rate;
+
+    ret = ff_framesync_init(&s->fs, ctx, s->nb_inputs);
+    if (ret < 0)
+        return ret;
+
+    s->fs.opaque = s;
+    s->fs.on_event = filter_frame;
+
+    for (i = 0; i < s->nb_inputs; i++) {
+        AVFilterLink *inlink = ctx->inputs[i];
+
+        s->fs.in[i].time_base = inlink->time_base;
+        s->fs.in[i].sync      = 1;
+        s->fs.in[i].before    = EXT_STOP;
+        s->fs.in[i].after     = EXT_INFINITY;
+    }
+
+    ret = ff_framesync_configure(&s->fs);
+    outlink->time_base = s->fs.time_base;
+
+    return ret;
 }
 
 static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
@@ -425,14 +519,13 @@ static const AVOption frei0r_options[] = {
     { NULL }
 };
 
-AVFILTER_DEFINE_CLASS(frei0r);
+FRAMESYNC_DEFINE_CLASS(frei0r, Frei0rContext, fs);
 
-static const AVFilterPad avfilter_vf_frei0r_inputs[] = {
+static const AVFilterPad avfilter_vf_frei0r_outputs[] = {
     {
-        .name         = "default",
-        .type         = AVMEDIA_TYPE_VIDEO,
-        .config_props = config_input_props,
-        .filter_frame = filter_frame,
+        .name          = "default",
+        .type          = AVMEDIA_TYPE_VIDEO,
+        .config_props  = filter_config_props,
     },
 };
 
@@ -440,12 +533,13 @@ const FFFilter ff_vf_frei0r = {
     .p.name        = "frei0r",
     .p.description = NULL_IF_CONFIG_SMALL("Apply a frei0r effect."),
     .p.priv_class  = &frei0r_class,
-    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    .preinit       = frei0r_framesync_preinit,
     .init          = filter_init,
     .uninit        = uninit,
+    .activate      = filter_activate,
     .priv_size     = sizeof(Frei0rContext),
-    FILTER_INPUTS(avfilter_vf_frei0r_inputs),
-    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_OUTPUTS(avfilter_vf_frei0r_outputs),
     FILTER_QUERY_FUNC2(query_formats),
     .process_command = process_command,
 };
