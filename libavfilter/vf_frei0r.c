@@ -316,17 +316,26 @@ static av_cold void uninit(AVFilterContext *ctx)
         dlclose(s->dl_handle);
 }
 
-static int config_input_props(AVFilterLink *inlink)
+static int config_link_props(AVFilterLink *outlink)
 {
-    AVFilterContext *ctx = inlink->dst;
+    AVFilterContext *ctx = outlink->src;
     Frei0rContext *s = ctx->priv;
+    FilterLink *il = ff_filter_link(ctx->inputs[0]);
+    FilterLink *ol = ff_filter_link(outlink);
+    int width = ctx->inputs[0]->w;
+    int height = ctx->inputs[0]->h;
 
     if (s->destruct && s->instance)
         s->destruct(s->instance);
-    if (!(s->instance = s->construct(inlink->w, inlink->h))) {
+    if (!(s->instance = s->construct(width, height))) {
         av_log(ctx, AV_LOG_ERROR, "Impossible to load frei0r instance.\n");
         return AVERROR(EINVAL);
     }
+
+    outlink->w = width;
+    outlink->h = height;
+    outlink->sample_aspect_ratio = ctx->inputs[0]->sample_aspect_ratio;
+    ol->frame_rate = il->frame_rate;
 
     return set_params(ctx, s->params);
 }
@@ -408,7 +417,6 @@ static av_cold int filter_init(AVFilterContext *ctx)
     AVFilterPad pad = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .name         = av_strdup("input0"),
-        .config_props = config_input_props,
         .filter_frame = filter_frame,
     };
     int ret;
@@ -447,6 +455,14 @@ static const AVOption frei0r_options[] = {
 
 AVFILTER_DEFINE_CLASS(frei0r);
 
+static const AVFilterPad avfilter_vf_frei0r_outputs[] = {
+    {
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_VIDEO,
+        .config_props = config_link_props,
+    },
+};
+
 const FFFilter ff_vf_frei0r = {
     .p.name        = "frei0r",
     .p.description = NULL_IF_CONFIG_SMALL("Apply a frei0r effect."),
@@ -455,7 +471,7 @@ const FFFilter ff_vf_frei0r = {
     .init          = filter_init,
     .uninit        = uninit,
     .priv_size     = sizeof(Frei0rContext),
-    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_OUTPUTS(avfilter_vf_frei0r_outputs),
     FILTER_QUERY_FUNC2(query_formats),
     .process_command = process_command,
 };
