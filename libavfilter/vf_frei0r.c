@@ -516,7 +516,7 @@ static const AVOption frei0r_options[] = {
     { NULL }
 };
 
-AVFILTER_DEFINE_CLASS(frei0r);
+FRAMESYNC_DEFINE_CLASS(frei0r, Frei0rContext, fs);
 
 static const AVFilterPad avfilter_vf_frei0r_outputs[] = {
     {
@@ -531,6 +531,7 @@ const FFFilter ff_vf_frei0r = {
     .p.description = NULL_IF_CONFIG_SMALL("Apply a frei0r effect."),
     .p.priv_class  = &frei0r_class,
     .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    .preinit       = frei0r_framesync_preinit,
     .init          = filter_init,
     .uninit        = uninit,
     .activate      = filter_activate,
