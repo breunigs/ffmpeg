@@ -373,10 +373,15 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
      * frei0r expects line size to be width*4 so we want an align of 1
      * to ensure lines aren't padded out. */
     AVFrame *out = ff_default_get_video_buffer2(outlink, outlink->w, outlink->h, 1);
+    int ret;
     if (!out)
         goto fail;
 
-    av_frame_copy_props(out, in);
+    ret = av_frame_copy_props(out, in);
+    if (ret < 0) {
+        av_frame_free(&out);
+        return ret;
+    }
 
     if (in->linesize[0] != out->linesize[0]) {
         AVFrame *in2 = ff_default_get_video_buffer2(outlink, outlink->w, outlink->h, 1);
