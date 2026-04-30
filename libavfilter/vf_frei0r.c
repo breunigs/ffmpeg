@@ -41,6 +41,7 @@
 #include "avfilter.h"
 #include "filters.h"
 #include "formats.h"
+#include "framesync.h"
 #include "video.h"
 
 #ifdef __APPLE__
@@ -75,6 +76,9 @@ typedef struct Frei0rContext {
     f0r_destruct_f        destruct;
     f0r_deinit_f          deinit;
 
+    FFFrameSync fs;
+    AVFrame **frames;
+    int nb_inputs;
     char *dl_name;
     char *params;
     AVRational framerate;
@@ -291,6 +295,8 @@ static av_cold int frei0r_init(AVFilterContext *ctx,
         return AVERROR(EINVAL);
     }
 
+    s->nb_inputs = type == F0R_PLUGIN_TYPE_SOURCE ? 0 : 1;
+
     av_log(ctx, AV_LOG_VERBOSE,
            "name:%s author:'%s' explanation:'%s' color_model:%s "
            "frei0r_version:%d version:%d.%d num_params:%d\n",
@@ -314,6 +320,9 @@ static av_cold void uninit(AVFilterContext *ctx)
         s->deinit();
     if (s->dl_handle)
         dlclose(s->dl_handle);
+
+    ff_framesync_uninit(&s->fs);
+    av_freep(&s->frames);
 }
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
@@ -427,6 +436,10 @@ static av_cold int filter_init(AVFilterContext *ctx)
     ret = frei0r_init(ctx, s->dl_name, F0R_PLUGIN_TYPE_FILTER);
     if (ret < 0)
         return ret;
+
+    s->frames = av_calloc(1, sizeof(*s->frames));
+    if (!s->frames)
+        return AVERROR(ENOMEM);
 
     return ff_append_inpad_free_name(ctx, &pad);
 }
