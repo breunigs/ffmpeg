@@ -304,13 +304,6 @@ static av_cold int frei0r_init(AVFilterContext *ctx,
     return 0;
 }
 
-static av_cold int filter_init(AVFilterContext *ctx)
-{
-    Frei0rContext *s = ctx->priv;
-
-    return frei0r_init(ctx, s->dl_name, F0R_PLUGIN_TYPE_FILTER);
-}
-
 static av_cold void uninit(AVFilterContext *ctx)
 {
     Frei0rContext *s = ctx->priv;
@@ -409,6 +402,27 @@ fail:
     return AVERROR(ENOMEM);
 }
 
+static av_cold int filter_init(AVFilterContext *ctx)
+{
+    Frei0rContext *s = ctx->priv;
+    AVFilterPad pad = {
+        .type         = AVMEDIA_TYPE_VIDEO,
+        .name         = av_strdup("input0"),
+        .config_props = config_input_props,
+        .filter_frame = filter_frame,
+    };
+    int ret;
+
+    if (!pad.name)
+        return AVERROR(ENOMEM);
+
+    ret = frei0r_init(ctx, s->dl_name, F0R_PLUGIN_TYPE_FILTER);
+    if (ret < 0)
+        return ret;
+
+    return ff_append_inpad_free_name(ctx, &pad);
+}
+
 static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
                            char *res, int res_len, int flags)
 {
@@ -433,24 +447,14 @@ static const AVOption frei0r_options[] = {
 
 AVFILTER_DEFINE_CLASS(frei0r);
 
-static const AVFilterPad avfilter_vf_frei0r_inputs[] = {
-    {
-        .name         = "default",
-        .type         = AVMEDIA_TYPE_VIDEO,
-        .config_props = config_input_props,
-        .filter_frame = filter_frame,
-    },
-};
-
 const FFFilter ff_vf_frei0r = {
     .p.name        = "frei0r",
     .p.description = NULL_IF_CONFIG_SMALL("Apply a frei0r effect."),
     .p.priv_class  = &frei0r_class,
-    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .init          = filter_init,
     .uninit        = uninit,
     .priv_size     = sizeof(Frei0rContext),
-    FILTER_INPUTS(avfilter_vf_frei0r_inputs),
     FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_QUERY_FUNC2(query_formats),
     .process_command = process_command,
