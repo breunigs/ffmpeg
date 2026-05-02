@@ -325,51 +325,67 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_freep(&s->frames);
 }
 
-static int filter_frame(AVFilterLink *inlink, AVFrame *in)
+static int filter_frame(FFFrameSync *fs)
 {
-    Frei0rContext *s = inlink->dst->priv;
-    AVFilterLink *outlink = inlink->dst->outputs[0];
-    AVFrame *aligned = NULL;
-    AVFrame *src = in;
+    AVFilterContext *ctx = fs->parent;
+    AVFilterLink *outlink = ctx->outputs[0];
+    Frei0rContext *s = fs->opaque;
+    AVFrame **in = s->frames;
+    AVFrame *aligned[3] = { NULL };
     AVFrame *out;
-    int ret;
+    int i, ret;
+
+    for (i = 0; i < s->nb_inputs; i++) {
+        ret = ff_framesync_get_frame(&s->fs, i, &in[i], 0);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (ctx->is_disabled) {
+        out = av_frame_clone(in[0]);
+        if (!out)
+            return AVERROR(ENOMEM);
+        return ff_filter_frame(outlink, out);
+    }
 
     /* align parameter is the line alignment, not the buffer alignment.
      * frei0r expects line size to be width*4 so we want an align of 1
      * to ensure lines aren't padded out. */
     out = ff_default_get_video_buffer2(outlink, outlink->w, outlink->h, 1);
-    if (!out) {
-        ret = AVERROR(ENOMEM);
-        goto end;
+    if (!out)
+        return AVERROR(ENOMEM);
+
+    ret = av_frame_copy_props(out, in[0]);
+    if (ret < 0) {
+        av_frame_free(&out);
+        return ret;
     }
+    out->pts = av_rescale_q(s->fs.pts, s->fs.time_base, outlink->time_base);
 
-    ret = av_frame_copy_props(out, in);
-    if (ret < 0)
-        goto end;
-
-    if (in->linesize[0] != out->linesize[0]) {
-        aligned = ff_default_get_video_buffer2(outlink, outlink->w, outlink->h, 1);
-        if (!aligned) {
-            ret = AVERROR(ENOMEM);
-            goto end;
+    for (i = 0; i < s->nb_inputs; i++) {
+        if (in[i]->linesize[0] != out->linesize[0]) {
+            aligned[i] = ff_default_get_video_buffer2(outlink, outlink->w, outlink->h, 1);
+            if (!aligned[i]) {
+                ret = AVERROR(ENOMEM);
+                goto end;
+            }
+            ret = av_frame_copy(aligned[i], in[i]);
+            if (ret < 0)
+                goto end;
+            in[i] = aligned[i];
         }
-        ret = av_frame_copy(aligned, in);
-        if (ret < 0)
-            goto end;
-        src = aligned;
     }
 
-    s->update(s->instance, in->pts * av_q2d(inlink->time_base),
-                   (const uint32_t *)src->data[0],
-                   (uint32_t *)out->data[0]);
+    s->update(s->instance, s->fs.pts * av_q2d(s->fs.time_base),
+                    (const uint32_t *)in[0]->data[0],
+                    (uint32_t *)out->data[0]);
 
     ret = ff_filter_frame(outlink, out);
-    out = NULL;
 
 end:
-    av_frame_free(&in);
-    av_frame_free(&aligned);
-    av_frame_free(&out);
+    for (i = 0; i < s->nb_inputs; i++)
+        av_frame_free(&aligned[i]);
+
     return ret;
 }
 
@@ -381,6 +397,7 @@ static int config_link_props(AVFilterLink *outlink)
     FilterLink *ol = ff_filter_link(outlink);
     int width = ctx->inputs[0]->w;
     int height = ctx->inputs[0]->h;
+    int i, ret;
 
     if (s->destruct && s->instance)
         s->destruct(s->instance);
@@ -389,12 +406,35 @@ static int config_link_props(AVFilterLink *outlink)
         return AVERROR(EINVAL);
     }
 
+    ret = set_params(ctx, s->params);
+    if (ret < 0)
+        return ret;
+
     outlink->w = width;
     outlink->h = height;
     outlink->sample_aspect_ratio = ctx->inputs[0]->sample_aspect_ratio;
     ol->frame_rate = il->frame_rate;
 
-    return set_params(ctx, s->params);
+    ret = ff_framesync_init(&s->fs, ctx, s->nb_inputs);
+    if (ret < 0)
+        return ret;
+
+    s->fs.opaque = s;
+    s->fs.on_event = filter_frame;
+
+    for (i = 0; i < s->nb_inputs; i++) {
+        AVFilterLink *inlink = ctx->inputs[i];
+
+        s->fs.in[i].time_base = inlink->time_base;
+        s->fs.in[i].sync      = 1;
+        s->fs.in[i].before    = EXT_STOP;
+        s->fs.in[i].after     = EXT_INFINITY;
+    }
+
+    ret = ff_framesync_configure(&s->fs);
+    outlink->time_base = s->fs.time_base;
+
+    return ret;
 }
 
 static int query_formats(const AVFilterContext *ctx,
@@ -424,13 +464,18 @@ static int query_formats(const AVFilterContext *ctx,
     return ff_set_common_formats2(ctx, cfg_in, cfg_out, formats);
 }
 
+static int filter_activate(AVFilterContext *ctx)
+{
+    Frei0rContext *s = ctx->priv;
+    return ff_framesync_activate(&s->fs);
+}
+
 static av_cold int filter_init(AVFilterContext *ctx)
 {
     Frei0rContext *s = ctx->priv;
     AVFilterPad pad = {
-        .type         = AVMEDIA_TYPE_VIDEO,
-        .name         = av_strdup("input0"),
-        .filter_frame = filter_frame,
+        .type = AVMEDIA_TYPE_VIDEO,
+        .name = av_strdup("input0"),
     };
     int ret;
 
@@ -447,6 +492,7 @@ static av_cold int filter_init(AVFilterContext *ctx)
 
     return ff_append_inpad_free_name(ctx, &pad);
 }
+
 
 static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
                            char *res, int res_len, int flags)
@@ -487,6 +533,7 @@ const FFFilter ff_vf_frei0r = {
     .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS | AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .init          = filter_init,
     .uninit        = uninit,
+    .activate      = filter_activate,
     .priv_size     = sizeof(Frei0rContext),
     FILTER_OUTPUTS(avfilter_vf_frei0r_outputs),
     FILTER_QUERY_FUNC2(query_formats),
