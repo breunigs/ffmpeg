@@ -329,44 +329,48 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     Frei0rContext *s = inlink->dst->priv;
     AVFilterLink *outlink = inlink->dst->outputs[0];
+    AVFrame *aligned = NULL;
+    AVFrame *src = in;
+    AVFrame *out;
+    int ret;
+
     /* align parameter is the line alignment, not the buffer alignment.
      * frei0r expects line size to be width*4 so we want an align of 1
      * to ensure lines aren't padded out. */
-    AVFrame *out = ff_default_get_video_buffer2(outlink, outlink->w, outlink->h, 1);
-    int ret;
-    if (!out)
-        goto fail;
-
-    ret = av_frame_copy_props(out, in);
-    if (ret < 0) {
-        av_frame_free(&out);
-        return ret;
+    out = ff_default_get_video_buffer2(outlink, outlink->w, outlink->h, 1);
+    if (!out) {
+        ret = AVERROR(ENOMEM);
+        goto end;
     }
 
+    ret = av_frame_copy_props(out, in);
+    if (ret < 0)
+        goto end;
+
     if (in->linesize[0] != out->linesize[0]) {
-        AVFrame *in2 = ff_default_get_video_buffer2(outlink, outlink->w, outlink->h, 1);
-        if (!in2)
-            goto fail;
-        av_frame_copy(in2, in);
-        if (av_frame_copy_props(in2, in) < 0) {
-            av_frame_free(&in2);
-            goto fail;
+        aligned = ff_default_get_video_buffer2(outlink, outlink->w, outlink->h, 1);
+        if (!aligned) {
+            ret = AVERROR(ENOMEM);
+            goto end;
         }
-        av_frame_free(&in);
-        in = in2;
+        ret = av_frame_copy(aligned, in);
+        if (ret < 0)
+            goto end;
+        src = aligned;
     }
 
     s->update(s->instance, in->pts * av_q2d(inlink->time_base),
-                   (const uint32_t *)in->data[0],
+                   (const uint32_t *)src->data[0],
                    (uint32_t *)out->data[0]);
 
-    av_frame_free(&in);
+    ret = ff_filter_frame(outlink, out);
+    out = NULL;
 
-    return ff_filter_frame(outlink, out);
-fail:
+end:
     av_frame_free(&in);
+    av_frame_free(&aligned);
     av_frame_free(&out);
-    return AVERROR(ENOMEM);
+    return ret;
 }
 
 static int config_link_props(AVFilterLink *outlink)
