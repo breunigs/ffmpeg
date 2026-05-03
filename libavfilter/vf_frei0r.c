@@ -343,11 +343,13 @@ static int filter_frame(FFFrameSync *fs)
 {
     AVFilterContext *ctx = fs->parent;
     AVFilterLink *outlink = ctx->outputs[0];
+    FilterLink *ol = ff_filter_link(outlink);
     Frei0rContext *s = fs->opaque;
     AVFrame **in = s->frames;
     AVFrame *aligned[3] = { NULL };
     AVFrame *out;
     int i, ret;
+    double time;
 
     for (i = 0; i < s->nb_inputs; i++) {
         ret = ff_framesync_get_frame(&s->fs, i, &in[i], 0);
@@ -375,6 +377,8 @@ static int filter_frame(FFFrameSync *fs)
         return ret;
     }
     out->pts = av_rescale_q(s->fs.pts, s->fs.time_base, outlink->time_base);
+    if (s->nb_inputs >= 2 && ol->frame_rate.den == 0)
+        out->duration = 0;
 
     for (i = 0; i < s->nb_inputs; i++) {
         if (in[i]->linesize[0] != out->linesize[0]) {
@@ -390,9 +394,18 @@ static int filter_frame(FFFrameSync *fs)
         }
     }
 
-    s->update(s->instance, s->fs.pts * av_q2d(s->fs.time_base),
-                    (const uint32_t *)in[0]->data[0],
-                    (uint32_t *)out->data[0]);
+    time = s->fs.pts * av_q2d(s->fs.time_base);
+    if (s->nb_inputs == 1) {
+        s->update(s->instance, time,
+                  (const uint32_t *)in[0]->data[0],
+                  (uint32_t *)out->data[0]);
+    } else {
+        s->update2(s->instance, time,
+                   (const uint32_t *)in[0]->data[0],
+                   (const uint32_t *)in[1]->data[0],
+                   s->nb_inputs >= 3 ? (const uint32_t *)in[2]->data[0] : NULL,
+                   (uint32_t *)out->data[0]);
+    }
 
     ret = ff_filter_frame(outlink, out);
 
@@ -413,6 +426,15 @@ static int config_link_props(AVFilterLink *outlink)
     int height = ctx->inputs[0]->h;
     int i, ret;
 
+    for (i = 1; i < s->nb_inputs; i++) {
+        if (ctx->inputs[i]->w != width || ctx->inputs[i]->h != height) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "Input %d dimensions %dx%d do not match input %d dimensions %dx%d.\n",
+                   i, ctx->inputs[i]->w, ctx->inputs[i]->h, 0, width, height);
+            return AVERROR(EINVAL);
+        }
+    }
+
     if (s->destruct && s->instance)
         s->destruct(s->instance);
     if (!(s->instance = s->construct(width, height))) {
@@ -428,6 +450,17 @@ static int config_link_props(AVFilterLink *outlink)
     outlink->h = height;
     outlink->sample_aspect_ratio = ctx->inputs[0]->sample_aspect_ratio;
     ol->frame_rate = il->frame_rate;
+
+    for (i = 1; i < s->nb_inputs; i++) {
+        il = ff_filter_link(ctx->inputs[i]);
+        if (ol->frame_rate.num != il->frame_rate.num ||
+            ol->frame_rate.den != il->frame_rate.den) {
+            av_log(ctx, AV_LOG_VERBOSE,
+                    "Video inputs have different frame rates, output will be VFR\n");
+            ol->frame_rate = av_make_q(1, 0);
+            break;
+        }
+    }
 
     ret = ff_framesync_init(&s->fs, ctx, s->nb_inputs);
     if (ret < 0)
@@ -487,24 +520,31 @@ static int filter_activate(AVFilterContext *ctx)
 static av_cold int filter_init(AVFilterContext *ctx)
 {
     Frei0rContext *s = ctx->priv;
-    AVFilterPad pad = {
-        .type = AVMEDIA_TYPE_VIDEO,
-        .name = av_strdup("input0"),
-    };
-    int ret;
+    int i, ret;
 
-    if (!pad.name)
-        return AVERROR(ENOMEM);
-
-    ret = frei0r_init(ctx, s->dl_name, 1, 1);
+    ret = frei0r_init(ctx, s->dl_name, 1, 3);
     if (ret < 0)
         return ret;
 
-    s->frames = av_calloc(1, sizeof(*s->frames));
+    s->frames = av_calloc(s->nb_inputs, sizeof(*s->frames));
     if (!s->frames)
         return AVERROR(ENOMEM);
 
-    return ff_append_inpad_free_name(ctx, &pad);
+    for (i = 0; i < s->nb_inputs; i++) {
+        AVFilterPad pad = {
+            .type = AVMEDIA_TYPE_VIDEO,
+            .name = av_asprintf("input%d", i),
+        };
+
+        if (!pad.name)
+            return AVERROR(ENOMEM);
+
+        ret = ff_append_inpad_free_name(ctx, &pad);
+        if (ret < 0)
+            return ret;
+    }
+
+    return 0;
 }
 
 static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
