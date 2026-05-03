@@ -65,6 +65,7 @@ typedef void (*f0r_get_param_value_f)(f0r_instance_t instance, f0r_param_t param
 typedef struct Frei0rContext {
     const AVClass *class;
     f0r_update_f update;
+    f0r_update2_f update2;
     void *dl_handle;            /* dynamic library handle   */
     f0r_instance_t instance;
     f0r_plugin_info_t plugin_info;
@@ -193,8 +194,8 @@ static int load_path(AVFilterContext *ctx, void **handle_ptr, const char *prefix
     return 0;
 }
 
-static av_cold int frei0r_init(AVFilterContext *ctx,
-                               const char *dl_name, int type)
+static av_cold int frei0r_init(AVFilterContext *ctx, const char *dl_name,
+                               int min_inputs, int max_inputs)
 {
     Frei0rContext *s = ctx->priv;
     f0r_init_f            f0r_init;
@@ -272,7 +273,6 @@ static av_cold int frei0r_init(AVFilterContext *ctx,
         !(s->get_param_info  = load_sym(ctx, "f0r_get_param_info" )) ||
         !(s->get_param_value = load_sym(ctx, "f0r_get_param_value")) ||
         !(s->set_param_value = load_sym(ctx, "f0r_set_param_value")) ||
-        !(s->update          = load_sym(ctx, "f0r_update"         )) ||
         !(s->construct       = load_sym(ctx, "f0r_construct"      )) ||
         !(s->destruct        = load_sym(ctx, "f0r_destruct"       )) ||
         !(s->deinit          = load_sym(ctx, "f0r_deinit"         )))
@@ -285,7 +285,23 @@ static av_cold int frei0r_init(AVFilterContext *ctx,
 
     f0r_get_plugin_info(&s->plugin_info);
     pi = &s->plugin_info;
-    if (pi->plugin_type != type) {
+
+    s->nb_inputs = pi->plugin_type == F0R_PLUGIN_TYPE_SOURCE ? 0 :
+                   pi->plugin_type == F0R_PLUGIN_TYPE_FILTER ? 1 :
+                   pi->plugin_type == F0R_PLUGIN_TYPE_MIXER2 ? 2 :
+                   pi->plugin_type == F0R_PLUGIN_TYPE_MIXER3 ? 3 : -1;
+
+    if (s->nb_inputs < 2) {
+        s->update = load_sym(ctx, "f0r_update");
+        if (!s->update)
+            return AVERROR(EINVAL);
+    } else {
+        s->update2 = load_sym(ctx, "f0r_update2");
+        if (!s->update2)
+            return AVERROR(EINVAL);
+    }
+
+    if (s->nb_inputs < min_inputs || s->nb_inputs > max_inputs) {
         av_log(ctx, AV_LOG_ERROR,
                "Invalid type '%s' for this plugin\n",
                pi->plugin_type == F0R_PLUGIN_TYPE_FILTER ? "filter" :
@@ -294,8 +310,6 @@ static av_cold int frei0r_init(AVFilterContext *ctx,
                pi->plugin_type == F0R_PLUGIN_TYPE_MIXER3 ? "mixer3" : "unknown");
         return AVERROR(EINVAL);
     }
-
-    s->nb_inputs = type == F0R_PLUGIN_TYPE_SOURCE ? 0 : 1;
 
     av_log(ctx, AV_LOG_VERBOSE,
            "name:%s author:'%s' explanation:'%s' color_model:%s "
@@ -482,7 +496,7 @@ static av_cold int filter_init(AVFilterContext *ctx)
     if (!pad.name)
         return AVERROR(ENOMEM);
 
-    ret = frei0r_init(ctx, s->dl_name, F0R_PLUGIN_TYPE_FILTER);
+    ret = frei0r_init(ctx, s->dl_name, 1, 1);
     if (ret < 0)
         return ret;
 
@@ -492,7 +506,6 @@ static av_cold int filter_init(AVFilterContext *ctx)
 
     return ff_append_inpad_free_name(ctx, &pad);
 }
-
 
 static int process_command(AVFilterContext *ctx, const char *cmd, const char *args,
                            char *res, int res_len, int flags)
@@ -548,7 +561,7 @@ static av_cold int source_init(AVFilterContext *ctx)
     s->time_base.num = s->framerate.den;
     s->time_base.den = s->framerate.num;
 
-    return frei0r_init(ctx, s->dl_name, F0R_PLUGIN_TYPE_SOURCE);
+    return frei0r_init(ctx, s->dl_name, 0, 0);
 }
 
 static int source_config_props(AVFilterLink *outlink)
